@@ -2,6 +2,7 @@ from maproulette import app
 from flask.ext.restful import reqparse, fields, marshal, \
     marshal_with, Api, Resource
 from flask.ext.restful.fields import Raw
+from flask.ext.restful.utils import cors
 from flask import session, request, abort, url_for
 from maproulette.helpers import get_random_task,\
     get_challenge_or_404, get_task_or_404,\
@@ -76,6 +77,7 @@ user_summary = {
 }
 
 api = Api(app)
+api.decorators = [cors.crossdomain(origin=app.config['METRICS_URL'])]
 
 # override the default JSON representation to support the geo objects
 
@@ -219,6 +221,7 @@ class ApiStats(Resource):
     def get(self, challenge_slug=None, user_id=None):
         from dateutil import parser as dateparser
         from datetime import datetime
+        from maproulette.models import AggregateMetrics
 
         start = None
         end = None
@@ -231,56 +234,37 @@ class ApiStats(Resource):
 
         args = parser.parse_args()
 
-        breakdown = None
+        breakdown = False
 
-        # base CTE and query
-        # the base CTE gets the set of latest actions for any task
-        latest_cte = db.session.query(
-            Action.id,
-            Action.task_id,
-            Action.timestamp,
-            Action.user_id,
-            Action.status,
-            Task.challenge_slug,
-            User.display_name).join(
-            Task).outerjoin(User).distinct(
-            Action.task_id).order_by(
-            Action.task_id,
-            Action.id.desc()).cte(name='latest')
+        select_fields = [
+            AggregateMetrics.status,
+            func.sum(AggregateMetrics.count)]
 
-        # the base query gets a count on the base CTE grouped by status,
-        # optionally broken down by users or challenges
+        group_fields = [
+            AggregateMetrics.status]
+
         if request.path.endswith('/users'):
-            breakdown = 'users'
-            stats_query = db.session.query(
-                latest_cte.c.display_name,
-                latest_cte.c.status,
-                func.count(latest_cte.c.id)).group_by(
-                latest_cte.c.status,
-                latest_cte.c.display_name)
+            select_fields.insert(0, AggregateMetrics.user_name)
+            group_fields.insert(0, AggregateMetrics.user_name)
+            breakdown = True
         elif request.path.endswith('/challenges'):
-            breakdown = 'challenges'
-            stats_query = db.session.query(
-                latest_cte.c.challenge_slug,
-                latest_cte.c.status,
-                func.count(latest_cte.c.id)).group_by(
-                latest_cte.c.status,
-                latest_cte.c.challenge_slug)
-        else:
-            stats_query = db.session.query(
-                latest_cte.c.status,
-                func.count(latest_cte.c.id)).group_by(
-                latest_cte.c.status)
+            select_fields.insert(0, AggregateMetrics.challenge_slug)
+            group_fields.insert(0, AggregateMetrics.challenge_slug)
+            breakdown = True
+
+        stats_query = db.session.query(
+            *select_fields).group_by(
+            *group_fields)
 
         # stats for a specific challenge
         if challenge_slug is not None:
-            stats_query = stats_query.filter(
-                latest_cte.c.challenge_slug == challenge_slug)
+            stats_query = stats_query.filter_by(
+                challenge_slug=challenge_slug)
 
         # stats for a specific user
         if user_id is not None:
-            stats_query = stats_query.filter(
-                latest_cte.c.user_id == user_id)
+            stats_query = stats_query.filter_by(
+                user_id=user_id)
 
         # time slicing filters
         if args['start'] is not None:
@@ -290,9 +274,11 @@ class ApiStats(Resource):
             else:
                 end = dateparser.parse(args['end'])
             stats_query = stats_query.filter(
-                latest_cte.c.timestamp.between(start, end))
+                AggregateMetrics.timestamp.between(start, end))
 
-        if breakdown is not None:
+        app.logger.debug(stats_query)
+
+        if breakdown:
             # if this is a breakdown by a secondary variable, the
             # query will have returned three columns and we need to
             # build a nested dictionary.
@@ -305,7 +291,9 @@ class ApiStatsHistory(Resource):
 
     """Day to day history overall"""
 
-    def get(self):
+    def get(self, challenge_slug=None, user_id=None):
+
+        from maproulette.models import HistoricalMetrics as HM
 
         start = None
         end = None
@@ -320,11 +308,19 @@ class ApiStatsHistory(Resource):
 
         args = parser.parse_args()
 
-        query = db.session.query(
-            func.date_trunc('day', Action.timestamp).label('day'),
-            Action.status,
-            func.count(Action.id)).group_by(
-            'day', Action.status)
+        stats_query = db.session.query(
+            HM.timestamp,
+            HM.status,
+            func.sum(HM.count))
+
+        if challenge_slug is not None:
+            stats_query = stats_query.filter(HM.challenge_slug == challenge_slug)
+        if user_id is not None:
+            stats_query = stats_query.filter(HM.user_id == user_id)
+
+        stats_query = stats_query.group_by(
+            HM.timestamp, HM.status).order_by(
+            HM.status)
 
         # time slicing filters
         if args['start'] is not None:
@@ -333,96 +329,13 @@ class ApiStatsHistory(Resource):
                 end = datetime.utcnow()
             else:
                 end = dateparser.parse(args['end'])
-            query = query.filter(
+            stats_query = stats_query.filter(
                 Action.timestamp.between(start, end))
 
-        return as_stats_dict(
-            query.all(),
-            order=[1, 0, 2],
-            start=start,
-            end=end)
-
-
-class ApiStatsChallengeHistory(Resource):
-
-    """Day to day history for a challenge"""
-
-    def get(self, challenge_slug):
-
-        start = None
-        end = None
-
-        from dateutil import parser as dateparser
-        from datetime import datetime
-        parser = reqparse.RequestParser()
-        parser.add_argument('start', type=str,
-                            help='start datetime yyyymmddhhmm')
-        parser.add_argument('end', type=str,
-                            help='end datetime yyyymmddhhmm')
-
-        args = parser.parse_args()
-
-        query = db.session.query(
-            func.date_trunc('day', Action.timestamp).label('day'),
-            Action.status,
-            func.count(Action.id)).join(Task).filter_by(
-            challenge_slug=challenge_slug).group_by(
-            'day', Action.status)
-
-        # time slicing filters
-        if args['start'] is not None:
-            start = dateparser.parse(args['start'])
-            if args['end'] is None:
-                end = datetime.utcnow()
-            else:
-                end = dateparser.parse(args['end'])
-            query = query.filter(
-                Action.timestamp.between(start, end))
+        app.logger.debug(stats_query)
 
         return as_stats_dict(
-            query.all(),
-            order=[1, 0, 2],
-            start=start,
-            end=end)
-
-
-class ApiStatsUserHistory(Resource):
-
-    """Day to day history for a user"""
-
-    def get(self, user_id):
-
-        start = None
-        end = None
-
-        from dateutil import parser as dateparser
-        from datetime import datetime
-        parser = reqparse.RequestParser()
-        parser.add_argument('start', type=str,
-                            help='start datetime yyyymmddhhmm')
-        parser.add_argument('end', type=str,
-                            help='end datetime yyyymmddhhmm')
-
-        args = parser.parse_args()
-
-        query = db.session.query(
-            func.date_trunc('day', Action.timestamp).label('day'),
-            Action.status,
-            func.count(Action.id)).filter_by(user_id=user_id).group_by(
-            'day', Action.status)
-
-        # time slicing filters
-        if args['start'] is not None:
-            start = dateparser.parse(args['start'])
-            if args['end'] is None:
-                end = datetime.utcnow()
-            else:
-                end = dateparser.parse(args['end'])
-            query = query.filter(
-                Action.timestamp.between(start, end))
-
-        return as_stats_dict(
-            query.all(),
+            stats_query.all(),
             order=[1, 0, 2],
             start=start,
             end=end)
@@ -571,11 +484,11 @@ api.add_resource(ApiStats,
                  '/api/stats/user/<int:user_id>',
                  '/api/stats/user/<int:user_id>/challenges')
 api.add_resource(ApiStatsHistory,
-                 '/api/stats/history')
-api.add_resource(ApiStatsChallengeHistory,
-                 '/api/stats/challenge/<string:challenge_slug>/history')
-api.add_resource(ApiStatsUserHistory,
-                 '/api/stats/user/<int:user_id>/history')
+                 '/api/stats/history',
+                 '/api/stats/challenge/<string:challenge_slug>/history',
+                 '/api/stats/challenge/<string:challenge_slug>/user/<string:user_id>/history',
+                 '/api/stats/user/<int:user_id>/history',
+                 '/api/stats/user/<int:user_id>/challenge/<string:challenge_slug>/history')
 api.add_resource(ApiChallengeSummaryStats,
                  '/api/challenge/<string:challenge_slug>/summary')
 # task endpoints
@@ -611,24 +524,35 @@ class AdminApiChallenge(Resource):
     """Admin challenge creation endpoint"""
 
     def put(self, slug):
-        if challenge_exists(slug):
-            return {}
+        exists = challenge_exists(slug)
         try:
             payload = json.loads(request.data)
         except Exception:
-            abort(400)
-        if not 'title' in payload:
-            abort(400)
-        c = Challenge(
-            slug,
-            payload.get('title'),
-            payload.get('geometry'),
-            payload.get('description'),
-            payload.get('blurb'),
-            payload.get('help'),
-            payload.get('instruction'),
-            payload.get('active'),
-            payload.get('difficulty'))
+            abort(400, "JSON bad")
+        if not exists and 'title' not in payload:
+            abort(400, "No title")
+            return {}
+        if exists:
+            app.logger.debug('challenge existed, retrieving')
+            c = get_challenge_or_404(slug, abort_if_inactive=False)
+            if 'title' in payload:
+                c.title = payload.get('title')
+        else:
+            c = Challenge(slug, payload.get('title'))
+        if 'geometry' in payload:
+            c.geometry = payload.get('geometry')
+        if 'description' in payload:
+            c.description = payload.get('description')
+        if 'blurb' in payload:
+            c.blurb = payload.get('blurb')
+        if 'help' in payload:
+            c.help = payload.get('help')
+        if 'instruction' in payload:
+            c.instruction = payload.get('instruction')
+        if 'active' in payload:
+            c.active = payload.get('active')
+        if 'difficulty' in payload:
+            c.difficulty = payload.get('difficulty')
         db.session.add(c)
         db.session.commit()
         return {}
@@ -655,13 +579,13 @@ class AdminApiTaskStatuses(Resource):
 
 class AdminApiUpdateTask(Resource):
 
-    """Challenge Task Statuses endpoint"""
+    """Challenge Task Create / Update endpoint"""
 
     def put(self, slug, identifier):
         """Create or update one task."""
 
         # Parse the posted data
-        parse_task_json(json.loads(request.data), slug, identifier)
+        db.session.add(parse_task_json(slug, json.loads(request.data)))
         return {}, 201
 
     def delete(self, slug, identifier):
@@ -676,17 +600,21 @@ class AdminApiUpdateTask(Resource):
 
 class AdminApiUpdateTasks(Resource):
 
-    """Bulk task creation / update endpoint"""
+    """Bulk task create / update endpoint"""
 
     def put(self, slug):
 
-        app.logger.debug('putting multiple tasks')
-        app.logger.debug(len(request.data))
         # Get the posted data
-        taskdata = json.loads(request.data)
+        data = json.loads(request.data)
 
-        for task in taskdata:
-            parse_task_json(task, slug, task['identifier'], commit=False)
+        # debug output number of tasks being posted
+        app.logger.debug('posting {number} tasks...'.format(number=len(data)))
+
+        if len(data) > app.config['MAX_TASKS_BULK_UPDATE']:
+            abort(400, 'more than 5000 tasks in bulk update')
+
+        for task in data:
+            db.session.merge(parse_task_json(slug, task))
 
         # commit all dirty tasks at once.
         db.session.commit()
